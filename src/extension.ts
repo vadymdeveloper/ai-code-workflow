@@ -13,6 +13,7 @@ import { cleanJsonInput, formatJsonInput, parsePayload } from "./jsonInput";
 import { ApplyResult } from "./model";
 import {
   HandoffAsset,
+  RepomixPathSelection,
   cleanupWorkflowTempDirs,
   getProviderUrl,
   makeHandoffAsset,
@@ -21,6 +22,7 @@ import {
   updateProjectContext,
 } from "./workflow";
 import { resolveRepoPath } from "./validation";
+import { searchDomBindings, searchEventListeners, searchMarkup, searchScript, searchStyles } from "./webview/search";
 
 interface WebviewMessage {
   type: string;
@@ -33,6 +35,7 @@ interface WebviewMessage {
   assetName?: string;
   assets?: HandoffAsset[];
   handoffFilePaths?: string[];
+  repomixSelection?: RepomixPathSelection;
 }
 
 interface StatusMessage {
@@ -164,7 +167,7 @@ body {
   background: var(--vscode-editor-background);
 }
 
-button, textarea {
+button, textarea, input {
   font-family: inherit;
 }
 
@@ -430,6 +433,8 @@ textarea:focus {
   box-shadow: 0 0 0 2px var(--accent-dim);
 }
 
+${searchStyles}
+
 select {
   width: 138px;
   min-height: 30px;
@@ -559,6 +564,96 @@ select {
   text-overflow: ellipsis;
 }
 
+.repomix-scope {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface-strong) 74%, transparent);
+}
+
+.repomix-scope-header {
+  display: grid;
+  gap: 8px;
+}
+
+.repomix-summary {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.repomix-rule-row {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.repomix-rule-details {
+  min-width: 0;
+}
+
+.repomix-rule-details code {
+  display: block;
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  text-overflow: clip;
+}
+
+.repomix-rule-badge {
+  min-width: 58px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.repomix-rule-badge.include {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 38%, transparent);
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+}
+
+.repomix-rule-badge.exclude {
+  color: var(--bad);
+  border-color: color-mix(in srgb, var(--bad) 38%, transparent);
+  background: color-mix(in srgb, var(--bad) 12%, transparent);
+}
+
+.repomix-rule-actions {
+  display: inline-flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+
+.repomix-rule-actions button {
+  min-height: 24px;
+  padding: 3px 7px;
+  font-size: 10.5px;
+}
+
+@media (max-width: 520px) {
+  .repomix-rule-row {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .repomix-rule-actions {
+    justify-content: stretch;
+  }
+
+  .repomix-rule-actions button {
+    flex: 1;
+  }
+}
+
 .handoff-actions {
   margin-top: 12px;
 }
@@ -634,6 +729,19 @@ select {
             <span id="prompt-stats">Empty</span>
             <span id="autosave-status">Draft autosaved locally</span>
           </div>
+          <div class="repomix-scope">
+            <div class="repomix-scope-header">
+              <label>Repomix scope rules</label>
+              <div class="actions">
+                <button id="add-repomix-include" class="ghost" type="button">Include Files/Folders</button>
+                <button id="add-repomix-exclude" class="ghost" type="button">Exclude Files/Folders</button>
+                <button id="clear-repomix-paths" class="ghost" type="button">Clear Rules</button>
+              </div>
+            </div>
+            <div id="repomix-summary" class="repomix-summary">Repomix will scan the whole project. Add include/exclude rules to narrow it down.</div>
+            <div id="repomix-path-list" class="files hidden"></div>
+          </div>
+
           <div id="asset-drop" class="asset-drop" tabindex="0">
             <strong>Add screenshots and files</strong>
             <span>Paste screenshots with Ctrl+V, or add any local files. Everything listed here is copied into the next handoff package.</span>
@@ -698,8 +806,7 @@ select {
           </div>
         </div>
         <div class="panel-body">
-          <label for="patch-input">AI patch payload</label>
-          <textarea id="patch-input" spellcheck="false" placeholder='{ "operations": [] }'></textarea>
+${searchMarkup}
           <div class="stats">
             <span id="patch-stats">Empty</span>
             <button id="clean" class="ghost">Clear</button>
@@ -729,6 +836,7 @@ select {
   let handoffDir = state.handoffDir || "";
   let handoffFilePaths = state.handoffFilePaths || [];
   let assets = state.assets || [];
+  let repomixSelection = normalizeStoredRepomixSelection(state.repomixSelection);
   const supportsFileClipboard = ${process.platform === "win32" ? "true" : "false"};
   const encoder = new TextEncoder();
 
@@ -738,6 +846,7 @@ select {
   const provider = document.getElementById("provider");
   const builderOutput = document.getElementById("builder-output");
   const patchOutput = document.getElementById("patch-output");
+${searchDomBindings}
   const promptStats = document.getElementById("prompt-stats");
   const patchStats = document.getElementById("patch-stats");
 
@@ -745,20 +854,25 @@ select {
   const copyFiles = document.getElementById("copy-files");
   const openHandoff = document.getElementById("open-handoff");
   const assetList = document.getElementById("asset-list");
+  const repomixSummary = document.getElementById("repomix-summary");
+  const repomixPathList = document.getElementById("repomix-path-list");
 
   prompt.value = state.prompt || "";
   patchInput.value = state.patchInput || "";
+  patchSearchInput.value = state.patchSearchInput || "";
   provider.value = state.provider || ${JSON.stringify(initialProvider)};
 
   function persist() {
     vscode.setState({
       prompt: prompt.value,
       patchInput: patchInput.value,
+      patchSearchInput: patchSearchInput.value,
       preparedPrompt,
       handoffDir,
       handoffFilePaths,
       provider: provider.value,
-      assets
+      assets,
+      repomixSelection
     });
 
     updateAutosaveStatus();
@@ -785,7 +899,123 @@ select {
 
   function updateStats() {
     promptStats.textContent = byteStats(prompt.value);
-    patchStats.textContent = byteStats(patchInput.value);
+    const search = patchSearchInput.value;
+    if (!search) {
+      patchStats.textContent = byteStats(patchInput.value);
+      return;
+    }
+
+    const matches = searchMatches.length;
+    patchStats.textContent = byteStats(patchInput.value) + " / " + matches + " match" + (matches === 1 ? "" : "es");
+  }
+
+${searchScript}
+
+  function normalizeStoredRepomixSelection(value) {
+    if (value && Array.isArray(value.rules)) {
+      return {
+        rules: value.rules
+          .filter(rule => rule && (rule.action === "include" || rule.action === "exclude") && rule.path)
+          .map(rule => ({ action: rule.action, path: rule.path }))
+      };
+    }
+
+    if (value && Array.isArray(value.paths) && (value.mode === "include" || value.mode === "exclude")) {
+      return { rules: value.paths.map(itemPath => ({ action: value.mode, path: itemPath })) };
+    }
+
+    return { rules: [] };
+  }
+
+  function normalizeRepomixSelection() {
+    const seen = new Set();
+    const rules = [];
+    for (const rule of repomixSelection.rules || []) {
+      if (!rule || (rule.action !== "include" && rule.action !== "exclude") || !rule.path) continue;
+      const key = rule.action + "\u0000" + rule.path;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rules.push({ action: rule.action, path: rule.path });
+    }
+    repomixSelection = { rules };
+  }
+
+  function updateRepomixRule(index, action) {
+    repomixSelection.rules[index] = { ...repomixSelection.rules[index], action };
+    invalidatePreparedRequest();
+    renderRepomixSelection();
+    persist();
+  }
+
+  function removeRepomixRule(index) {
+    repomixSelection.rules.splice(index, 1);
+    invalidatePreparedRequest();
+    renderRepomixSelection();
+    persist();
+  }
+
+  function renderRepomixSelection() {
+    normalizeRepomixSelection();
+    const rules = repomixSelection.rules || [];
+    const includeCount = rules.filter(rule => rule.action === "include").length;
+    const excludeCount = rules.filter(rule => rule.action === "exclude").length;
+
+    document.getElementById("clear-repomix-paths").disabled = rules.length === 0;
+    repomixPathList.innerHTML = "";
+    repomixPathList.classList.toggle("hidden", rules.length === 0);
+
+    if (rules.length === 0) {
+      repomixSummary.textContent = "Repomix will scan the whole project. Add include/exclude rules to narrow it down.";
+      return;
+    }
+
+    repomixSummary.textContent = includeCount > 0
+      ? "Repomix will include " + includeCount + " selected item(s) and exclude " + excludeCount + " item(s)."
+      : "Repomix will scan the whole project except " + excludeCount + " excluded item(s).";
+
+    rules.forEach((rule, index) => {
+      const row = document.createElement("div");
+      row.className = "file-row repomix-rule-row";
+
+      const badge = document.createElement("span");
+      badge.className = "repomix-rule-badge " + rule.action;
+      badge.textContent = rule.action;
+
+      const details = document.createElement("div");
+      details.className = "repomix-rule-details";
+      const title = document.createElement("b");
+      title.textContent = rule.path.split(/[\\/]/).pop() || rule.path;
+      const location = document.createElement("code");
+      location.textContent = rule.path;
+      details.append(title, location);
+
+      const actions = document.createElement("div");
+      actions.className = "repomix-rule-actions";
+
+      const includeButton = document.createElement("button");
+      includeButton.className = "ghost";
+      includeButton.type = "button";
+      includeButton.textContent = "Include";
+      includeButton.disabled = rule.action === "include";
+      includeButton.onclick = () => updateRepomixRule(index, "include");
+
+      const excludeButton = document.createElement("button");
+      excludeButton.className = "ghost";
+      excludeButton.type = "button";
+      excludeButton.textContent = "Exclude";
+      excludeButton.disabled = rule.action === "exclude";
+      excludeButton.onclick = () => updateRepomixRule(index, "exclude");
+
+      const removeButton = document.createElement("button");
+      removeButton.className = "ghost";
+      removeButton.type = "button";
+      removeButton.textContent = "Remove";
+      removeButton.onclick = () => removeRepomixRule(index);
+
+      actions.append(includeButton, excludeButton, removeButton);
+      row.append(badge, details, actions);
+      repomixPathList.append(row);
+    });
   }
 
   function renderAssets() {
@@ -818,7 +1048,11 @@ select {
       if (button.classList.contains("tab")) return;
       button.disabled = isBusy || button.dataset.locked === "true";
     });
-    if (!isBusy) updatePreparedButtons();
+    if (!isBusy) {
+      updatePreparedButtons();
+      renderRepomixSelection();
+      updateSearchUi();
+    }
   }
 
   function updatePreparedButtons() {
@@ -840,11 +1074,13 @@ select {
       type,
       prompt: prompt.value,
       patchInput: patchInput.value,
+      patchSearchInput: patchSearchInput.value,
       preparedPrompt,
       handoffDir,
       handoffFilePaths,
       provider: provider.value,
-      assets
+      assets,
+      repomixSelection
     });
   }
 
@@ -854,7 +1090,7 @@ select {
     invalidatePreparedRequest();
     persist();
   });
-  patchInput.addEventListener("input", () => { updateStats(); persist(); });
+${searchEventListeners}
   provider.addEventListener("change", () => {
     persist();
     send("providerChanged");
@@ -903,6 +1139,15 @@ select {
   document.getElementById("prepare-request").onclick = () => send("prepareRequest");
   document.getElementById("open-provider").onclick = () => send("openProvider");
   document.getElementById("add-files").onclick = () => send("addFiles");
+  document.getElementById("add-repomix-include").onclick = () => send("addRepomixInclude");
+  document.getElementById("add-repomix-exclude").onclick = () => send("addRepomixExclude");
+  document.getElementById("clear-repomix-paths").onclick = () => {
+    repomixSelection = { rules: [] };
+    invalidatePreparedRequest();
+    renderRepomixSelection();
+    persist();
+    setStatus("builder", "Repomix selection cleared.", "idle");
+  };
   document.getElementById("clear-assets").onclick = () => {
     assets = [];
     invalidatePreparedRequest();
@@ -948,6 +1193,12 @@ select {
       renderAssets();
       persist();
     }
+    if (data.repomixSelection) {
+      repomixSelection = normalizeStoredRepomixSelection(data.repomixSelection);
+      invalidatePreparedRequest();
+      renderRepomixSelection();
+      persist();
+    }
     if (data.cleanupDone) {
       assets = [];
       preparedPrompt = "";
@@ -984,8 +1235,9 @@ select {
   });
 
   setTab(state.activeTab || "builder");
-  updateStats();
+  updateSearchUi();
   renderAssets();
+  renderRepomixSelection();
   updatePreparedButtons();
 })();
 </script>
@@ -1101,10 +1353,15 @@ async function handleMessage(
     return;
   }
 
+  if (msg.type === "addRepomixInclude" || msg.type === "addRepomixExclude") {
+    await handleAddRepomixRule(panel, msg.type === "addRepomixInclude" ? "include" : "exclude", msg.repomixSelection);
+    return;
+  }
+
   panel.webview.postMessage({ busy: true });
 
   if (msg.type === "prepareRequest") {
-    await handlePrepareRequest(context, panel, msg.prompt ?? "", msg.assets ?? [], msg.provider);
+    await handlePrepareRequest(context, panel, msg.prompt ?? "", msg.assets ?? [], msg.provider, msg.repomixSelection);
     return;
   }
 
@@ -1157,19 +1414,134 @@ async function handleAddFiles(panel: vscode.WebviewPanel): Promise<void> {
   });
 }
 
+async function handleAddRepomixRule(
+  panel: vscode.WebviewPanel,
+  action: "include" | "exclude",
+  currentSelection?: RepomixPathSelection
+): Promise<void> {
+  const repo = await getRepoRoot();
+  const currentRules = currentSelection?.rules ?? [];
+  const includeRules = currentRules.filter(rule => rule.action === "include");
+  const excludeBase = action === "exclude" && includeRules.length > 0
+    ? await pickRepomixIncludeBase(includeRules)
+    : undefined;
+
+  if (action === "exclude" && includeRules.length > 0 && !excludeBase) return;
+
+  const selected = await vscode.window.showOpenDialog({
+    canSelectFiles: true,
+    canSelectFolders: true,
+    canSelectMany: true,
+    defaultUri: vscode.Uri.file(excludeBase ?? repo),
+    title: action === "include"
+      ? "Choose files or folders Repomix should include"
+      : includeRules.length > 0
+        ? "Choose files or folders to exclude inside the included scope"
+        : "Choose files or folders Repomix should exclude",
+    filters: { "All files": ["*"] },
+  });
+
+  if (!selected?.length) return;
+
+  const selectedPaths = selected.map(uri => uri.fsPath);
+  if (action === "exclude" && includeRules.length > 0) {
+    const outsideIncludedScope = selectedPaths.filter(selectedPath => !isInsideAnyRepomixInclude(selectedPath, includeRules));
+    if (outsideIncludedScope.length > 0) {
+      postStatus(panel, {
+        area: "builder",
+        message: [
+          "Exclude can only target files/folders inside the included Repomix scope.",
+          "",
+          "Outside selected include scope:",
+          ...outsideIncludedScope.map(itemPath => `- ${itemPath}`),
+        ].join("\n"),
+        status: "error",
+      });
+      return;
+    }
+  }
+
+  const selectedRules = selectedPaths.map(itemPath => ({ action, path: itemPath }));
+  const nextSelection: RepomixPathSelection = {
+    rules: dedupeRepomixRules([...currentRules, ...selectedRules]),
+  };
+  const includeCount = nextSelection.rules.filter(rule => rule.action === "include").length;
+  const excludeCount = nextSelection.rules.filter(rule => rule.action === "exclude").length;
+
+  panel.webview.postMessage({
+    area: "builder",
+    message: `Repomix rules updated: ${includeCount} include, ${excludeCount} exclude.`,
+    status: "success",
+    repomixSelection: nextSelection,
+  });
+}
+
+async function pickRepomixIncludeBase(includeRules: Array<{ action: "include" | "exclude"; path: string }>): Promise<string | undefined> {
+  if (includeRules.length === 1) return includeRules[0].path;
+
+  const picked = await vscode.window.showQuickPick(
+    includeRules.map(rule => ({
+      label: path.basename(rule.path) || rule.path,
+      description: rule.path,
+      path: rule.path,
+    })),
+    {
+      placeHolder: "Pick the included folder/file where you want to exclude something",
+      matchOnDescription: true,
+    }
+  );
+
+  return picked?.path;
+}
+
+function isInsideAnyRepomixInclude(selectedPath: string, includeRules: Array<{ action: "include" | "exclude"; path: string }>): boolean {
+  const resolvedSelectedPath = path.resolve(selectedPath);
+
+  return includeRules.some(rule => {
+    const resolvedIncludePath = path.resolve(rule.path);
+    const relative = path.relative(resolvedIncludePath, resolvedSelectedPath);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+  });
+}
+
+function dedupeRepomixRules(rules: Array<{ action: "include" | "exclude"; path: string }>): Array<{ action: "include" | "exclude"; path: string }> {
+  const seen = new Set<string>();
+  const deduped: Array<{ action: "include" | "exclude"; path: string }> = [];
+
+  for (const rule of rules) {
+    if (!rule.path) continue;
+    const key = `${rule.action}\u0000${rule.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(rule);
+  }
+
+  return deduped;
+}
+
 async function handlePrepareRequest(
   context: vscode.ExtensionContext,
   panel: vscode.WebviewPanel,
   userPrompt: string,
   assets: HandoffAsset[],
-  provider?: string
+  provider?: string,
+  repomixSelection?: RepomixPathSelection
 ): Promise<void> {
   await vscode.workspace.saveAll(false);
   const repo = await getRepoRoot();
 
+  const repomixRules = repomixSelection?.rules ?? [];
+  const repomixIncludeCount = repomixRules.filter(rule => rule.action === "include").length;
+  const repomixExcludeCount = repomixRules.filter(rule => rule.action === "exclude").length;
+  const repomixScopeLine = repomixRules.length === 0
+    ? "Repomix will scan the whole project."
+    : repomixIncludeCount > 0
+      ? `Repomix will include ${repomixIncludeCount} selected item(s) and exclude ${repomixExcludeCount} selected item(s).`
+      : `Repomix will scan the whole project except ${repomixExcludeCount} excluded item(s).`;
+
   postStatus(panel, {
     area: "builder",
-    message: "Refreshing project context with Repomix...\n\n",
+    message: `Refreshing project context with Repomix...\n${repomixScopeLine}\n\n`,
     status: "running",
   });
 
@@ -1180,7 +1552,7 @@ async function handlePrepareRequest(
       status: "running",
       append: true,
     } satisfies StatusMessage);
-  });
+  }, repomixSelection);
 
   postStatus(panel, {
     area: "builder",
